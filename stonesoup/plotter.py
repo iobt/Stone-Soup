@@ -3179,6 +3179,535 @@ class AnimatedPlotterly(_Plotter):
         # we have called a plotting function so update flag
         self.plotting_function_called = True
 
+
+    def _rgba_from_color(color, alpha):
+        try:
+            c = color.lstrip('#')
+            if len(c) == 6:
+                r = int(c[0:2], 16); g = int(c[2:4], 16); b = int(c[4:6], 16)
+                return f'rgba({r},{g},{b},{alpha})'
+            if len(c) == 3:
+                r = int(c[0]*2, 16); g = int(c[1]*2, 16); b = int(c[2]*2, 16)
+                return f'rgba({r},{g},{b},{alpha})'
+            if color.startswith('rgb'):
+                nums = color[color.find('(')+1:color.find(')')].split(',')
+                r,g,b = [int(n) for n in nums[:3]]
+                return f'rgba({r},{g},{b},{alpha})'
+        except Exception:
+            pass
+        return color
+
+
+    def plot_track_headings(self, tracks, mapping, resize=True,plot_history=False, velocity_scale=1,label="Heading", **kwargs):
+        """
+        Plots the heading and velocity for each track as an arrow. The length of the arrow
+        can be scaled using the velocity_scale argument. Users can change linestyle, color, 
+        and marker using keyword arguments. 
+
+        Parameters
+        ----------
+        tracks: Collection of :class:`~.Track`
+            Collection of tracks which will be plotted. If not a collection, and instead a single
+            :class:`~.Track` type, the argument is modified to be a set to allow for iteration
+
+        mapping: list
+            List of items specifying the mapping of the position, velocity and heading angle
+            components of the state space
+        resize: bool
+            If True, plotter will change bounds so that tracks are in view
+        plot_history: bool
+            If true, plots all particles and uncertainty ellipses up to current time step
+        velocity_scale: float
+            Constant to scale the velocity of each track by. Controls the scale of the heading arrows.
+        label: str
+            Label to apply to all tracks for legend
+        \\*\\*kwargs: dict
+            Additional arguments to be passed to plot function. Defaults are ``linestyle="-"``,
+            ``marker='s'`` for :class:`~.Update` and ``marker='o'`` for other states.
+        """
+
+        label = kwargs.pop('track_label', None) or label
+
+        if not isinstance(tracks, Collection) or isinstance(tracks, StateMutableSequence):
+            tracks = {tracks}  # Make a set of length 1
+
+        # So that we can plot tracks for both the current time and for some previous times,
+        # we put plotting data for each track into a dictionary so that it can be easily
+        # accessed later.
+        data = [dict() for _ in tracks]
+
+        for n, track in enumerate(tracks):  # sum up means - accounts for particle filter
+
+            xydata = np.concatenate(
+                [(getattr(state, 'mean', state.state_vector)[mapping, :])
+                 for state in track],
+                axis=1)
+
+            # initialise arrays that go inside the dictionary
+            data[n].update(x=xydata[0],
+                           y=xydata[1],
+                           x2=xydata[0] + xydata[2]*velocity_scale*np.cos(xydata[3]),
+                           y2=xydata[1] + xydata[2]*velocity_scale*np.sin(xydata[3]),
+                           time=np.array([0 for _ in range(len(track))], dtype=object),
+                           time_str=np.array([0 for _ in range(len(track))], dtype=object),
+                           type=np.array([0 for _ in range(len(track))], dtype=object))
+
+            for k, state in enumerate(track):
+                # fill the arrays here
+                data[n]["time"][k] = state.timestamp
+                data[n]["time_str"][k] = str(state.timestamp)
+                data[n]["type"][k] = type(state).__name__
+
+        trace_base = len(self.fig.data)  # number of traces
+
+        # add dummy trace for legend for track
+
+        track_kwargs = dict(x=[], y=[], mode="markers+lines", line=dict(color=self.colorway[2]),
+                            marker=dict(size=10,symbol= "arrow-bar-up", angleref="previous"),
+                            legendgroup=label, legendrank=400, name=label,
+                            showlegend=True)
+        track_kwargs.update(kwargs)
+        self.fig.add_trace(go.Scatter(track_kwargs))
+
+        # and initialise traces for every track. Need to change a few kwargs:
+        track_kwargs.update({'showlegend': False})
+
+        for k, _ in enumerate(tracks):
+            # update track colours
+            track_kwargs.update({'line': dict(color=self.colorway[(k + 2) % len(self.colorway)]),
+                                'marker': dict(size=10,symbol= "arrow-bar-up", angleref="previous")})
+            track_kwargs.update(kwargs)
+            self.fig.add_trace(go.Scatter(track_kwargs))
+
+        for f,frame in enumerate(self.fig.frames):
+            # get current fig data and traces
+            data_ = list(frame.data)
+            traces_ = list(frame.traces)
+
+            # convert string to datetime object
+            frame_time = datetime.fromisoformat(frame.name)
+
+            self.all_masks[frame_time] = dict()  # save mask for later use
+            cutoff_time = (frame_time - self.time_window)
+            # add blank data to ensure legend stays in place
+            data_.append(go.Scatter(x=[-np.inf, np.inf], y=[-np.inf, np.inf]))
+            traces_.append(trace_base)  # ensure data is added to correct trace
+
+            for n, track in enumerate(tracks):
+
+                # all track points that come at or before the frame time
+                t_upper = [data[n]["time"] <= frame_time]
+                # only select detections that come after the time cut-off
+                t_lower = [data[n]["time"] >= cutoff_time]
+
+                # put together
+                mask = np.logical_and(t_upper, t_lower)
+
+                # put into dictionary for later use
+                if plot_history:
+                    self.all_masks[frame_time][n] = np.logical_and(t_upper, t_lower)
+                else:
+                    self.all_masks[frame_time][n] = [data[n]["time"] == frame_time]
+
+                # find x, y, time, and type
+                l        = np.sum(mask)
+                track_x = np.zeros((l,3))
+                track_y = np.zeros((l,3))
+                
+                track_x[:,0] = data[n]["x"][tuple(mask)]
+                track_x[:,1] = data[n]["x2"][tuple(mask)]
+                track_x[:,2] = np.nan
+                track_x      = np.append(track_x.reshape(-1,).tolist(),[np.inf])
+
+                track_y[:,0] = data[n]["y"][tuple(mask)]
+                track_y[:,1] = data[n]["y2"][tuple(mask)]
+                track_y[:,2] = np.nan
+                track_y      = np.append(track_y.reshape(-1,).tolist(),[np.inf])
+
+                track_type = data[n]["type"][tuple(mask)]
+                times = data[n]["time_str"][tuple(mask)]
+
+                data_.append(go.Scatter(x=track_x,  # plot track
+                                        y=track_y,
+                                        meta=track_type,
+                                        customdata=times,
+                                        hovertemplate='%{meta}' +
+                                                      '<br>(%{x}, %{y})' +
+                                                      '<br>Time: %{customdata}'))
+
+                traces_.append(trace_base + n + 1)  # add to correct trace
+
+                frame.data = data_
+                frame.traces = traces_
+
+        if resize:
+            self._resize(data, "tracks")
+
+
+    def plot_rects(self, tracks, mapping, uncertainty=False, resize=True,
+                    particle=False, plot_history=False, ellipse_points=30,
+                    label="Rects", **kwargs):
+        """
+        Plot oriented rectangles (with heading arrows) for each track state.
+
+        mapping: sequence-like with at least three indices: [x_index, y_index, theta_index]
+                theta is assumed to be in radians.
+
+        Additional kwargs (popped from kwargs so they don't leak into all traces):
+        rect_length: float (default 1.0) - full rectangle length along heading
+        rect_width:  float (default 0.5) - full rectangle width (perpendicular to heading)
+        rect_opacity: float (default 0.9) - maximum opacity for the most recent rectangle
+        arrow_length: float (default 0.6) - length of the arrow shaft (in same units as rect)
+        arrow_head_length: float (default 0.15) - length of triangular arrow head
+        arrow_width: float (default 0.12) - half-width of the triangular arrow head
+        history_fade: bool (default True) - if True older history rectangles fade linearly
+        max_history: int or None (default None) - if None, uses maximum track length observed
+
+        The function expects the plotting object (self) to have the same attributes/methods used
+        in your original plotting class:
+        - self.fig (plotly Figure with .frames)
+        - self.colorway (list of colors)
+        - self.time_window (timedelta)
+        - self.all_masks (dict)
+        - self._resize(data, "tracks")
+        - self._plot_particles_and_ellipses(...)
+        - self.plotting_function_called (flag to set True)
+        """
+
+        label = kwargs.pop('track_label', None) or label
+
+        # visual/arrow params
+        rect_length = kwargs.pop('rect_length', 1.0)
+        rect_width = kwargs.pop('rect_width', 0.5)
+        rect_opacity = kwargs.pop('rect_opacity', 0.9)
+        arrow_length = kwargs.pop('arrow_length', 0.6)  # shaft length
+        arrow_head_length = kwargs.pop('arrow_head_length', 0.15)
+        arrow_head_width = kwargs.pop('arrow_head_width', 0.12)
+        history_fade = kwargs.pop('history_fade', True)
+        user_max_history = kwargs.pop('max_history', None)
+
+        if not isinstance(tracks, Collection) or isinstance(tracks, (list, tuple)) and len(tracks) == 0:
+            tracks = {tracks}  # make set of one if single
+
+        # Validate mapping
+        if len(mapping) < 3:
+            raise ValueError("mapping must contain at least three indices: [x_index, y_index, theta_index]")
+
+        if not isinstance(tracks, Collection) or isinstance(tracks, StateMutableSequence):
+            tracks = {tracks}  # Make a set of length 1
+
+        # Prepare data per track (x, y, theta, time, time_str, type)
+        data = [dict() for _ in tracks]
+        max_history = 0
+        for n, track in enumerate(tracks):
+
+            print("Processing track", n)
+
+            # gather x, y, theta per state
+            stacked = np.concatenate(
+                [(getattr(state, 'mean', state.state_vector)[mapping, :]) for state in track],
+                axis=1
+            )
+            data[n].update(x=stacked[0],
+                        y=stacked[1],
+                        theta=stacked[2],
+                        time=np.array([0 for _ in range(stacked.shape[1])], dtype=object),
+                        time_str=np.array([0 for _ in range(stacked.shape[1])], dtype=object),
+                        type=np.array([0 for _ in range(stacked.shape[1])], dtype=object))
+            for k, state in enumerate(track):
+                data[n]["time"][k] = state.timestamp
+                data[n]["time_str"][k] = str(state.timestamp)
+                data[n]["type"][k] = type(state).__name__
+            if stacked.shape[1] > max_history:
+                max_history = stacked.shape[1]
+
+            print("Track", n, "has", len(data[n]["time"]), "states")
+            print(data[n])
+
+        # If user specified max_history and it's smaller, clamp; if larger, we will allocate extra empty traces
+        if user_max_history is not None:
+            max_history = int(user_max_history)
+
+        trace_base = len(self.fig.data)  # count existing traces
+
+        # add one legend dummy trace for tracks
+        track_legend_kwargs = dict(x=[], y=[], mode="lines", line=dict(color=self.colorway[2]),
+                                legendgroup=label, legendrank=400, name=label,
+                                showlegend=True)
+        track_legend_kwargs.update(kwargs)
+        self.fig.add_trace(go.Scatter(track_legend_kwargs))
+
+        # Per-track, pre-allocate traces for each history slot:
+        # For each history slot we allocate 3 traces: rectangle(fill), arrow shaft (line), arrow head(fill)
+        per_history_traces = 3
+        for k, _ in enumerate(tracks):
+            color = self.colorway[(k + 2) % len(self.colorway)]
+            for h in range(max_history):
+                # rectangle / filled polygon trace
+                rect_kwargs = dict(x=[], y=[], mode='lines', fill='toself',
+                                fillcolor=color, line=dict(color=color),
+                                opacity=rect_opacity, hoverinfo='skip', showlegend=False)
+                rect_kwargs.update(kwargs)
+                self.fig.add_trace(go.Scatter(rect_kwargs))
+
+                # arrow shaft (simple line) trace
+                shaft_kwargs = dict(x=[], y=[], mode='lines', line=dict(color=color, width=2),
+                                    hoverinfo='skip', showlegend=False)
+                shaft_kwargs.update(kwargs)
+                self.fig.add_trace(go.Scatter(shaft_kwargs))
+
+                # arrow head (filled small triangle) trace
+                head_kwargs = dict(x=[], y=[], mode='lines', fill='toself',
+                                fillcolor=color, line=dict(color=color), opacity=rect_opacity,
+                                hoverinfo='skip', showlegend=False)
+                head_kwargs.update(kwargs)
+                self.fig.add_trace(go.Scatter(head_kwargs))
+
+        # Now iterate through frames and populate these pre-allocated traces for each frame
+        for t,frame in enumerate(self.fig.frames):
+
+            print("Processing frame", t, "at time", frame.name)
+
+            data_ = list(frame.data)
+            traces_ = list(frame.traces)
+
+            frame_time = datetime.fromisoformat(frame.name)
+
+            self.all_masks[frame_time] = dict()
+            cutoff_time = (frame_time - self.time_window)
+
+            # add blank data to ensure legend stays in place (maps to trace_base index)
+            data_.append(go.Scatter(x=[-np.inf, np.inf], y=[-np.inf, np.inf]))
+            traces_.append(trace_base)
+
+            # compute base index of per-track traces (immediately after the legend dummy)
+            base_tracks = trace_base + 1
+
+            for n, track in enumerate(tracks):
+                # mask: states in the time window up to frame_time (or only exactly frame_time)
+                if plot_history:
+                    mask_bool = np.logical_and(data[n]["time"] <= frame_time,
+                                            data[n]["time"] >= cutoff_time)
+                else:
+                    mask_bool = (data[n]["time"] == frame_time)
+
+                if plot_history:
+                    self.all_masks[frame_time][n] = mask_bool
+                else:
+                    self.all_masks[frame_time][n] = (data[n]["time"] == frame_time)
+
+                indices = np.where(mask_bool)[0]
+                # sort indices by time (oldest -> newest)
+                if len(indices) > 0:
+                    times_for_sort = [data[n]["time"][i] for i in indices]
+                    order = np.argsort(times_for_sort)
+                    indices = indices[order]
+
+                # For fading, we consider the number of actual items to plot (m). We'll map them to the last m history slots
+                m = len(indices)
+                # Determine where to place them: we'll fill the most recent m history slots h = max_history-m .. max_history-1
+                start_slot = max_history - m
+
+                color = self.colorway[(n + 2) % len(self.colorway)]
+
+                # For each history slot, either fill with a polygon/arrow or leave empty
+                for h in range(max_history):
+                    print(f" Processing track {n}, history slot {h}, start_slot {start_slot}")
+                    slot_idx = start_slot + h if h >= start_slot else None
+                    rect_trace_idx = base_tracks + n * (max_history * per_history_traces) + h * per_history_traces + 0
+                    shaft_trace_idx = base_tracks + n * (max_history * per_history_traces) + h * per_history_traces + 1
+                    head_trace_idx = base_tracks + n * (max_history * per_history_traces) + h * per_history_traces + 2
+
+                    print(f" Track {n}, history slot {h}: max_history {max_history} maps to slot_idx {slot_idx}, trace indices: rect {rect_trace_idx}, shaft {shaft_trace_idx}, head {head_trace_idx}")
+
+                    if slot_idx is None or slot_idx >= max_history or m == 0:
+                        # No data for this slot -> append empty traces to keep frame.traces mapping stable
+                        data_.append(go.Scatter(x=[], y=[]))
+                        traces_.append(rect_trace_idx)
+
+                        data_.append(go.Scatter(x=[], y=[]))
+                        traces_.append(shaft_trace_idx)
+
+                        data_.append(go.Scatter(x=[], y=[]))
+                        traces_.append(head_trace_idx)
+                        continue
+
+                    # slot corresponds to which index in indices:
+                    idx_in_indices = h - max(0, start_slot)
+                    if idx_in_indices < 0 or idx_in_indices >= m:
+                        # empty
+                        data_.append(go.Scatter(x=[], y=[]))
+                        traces_.append(rect_trace_idx)
+
+                        data_.append(go.Scatter(x=[], y=[]))
+                        traces_.append(shaft_trace_idx)
+
+                        data_.append(go.Scatter(x=[], y=[]))
+                        traces_.append(head_trace_idx)
+                        continue
+
+                    state_idx = indices[idx_in_indices]
+                    x_c = float(data[n]["x"][state_idx])
+                    y_c = float(data[n]["y"][state_idx])
+                    theta = float(data[n]["theta"][state_idx])  # radians
+
+                    # compute fade factor for this history element (older -> smaller alpha)
+                    if m <= 1 or not history_fade:
+                        alpha = rect_opacity
+                    else:
+                        # position in chronology: j = 0..m-1 oldest->newest
+                        j = idx_in_indices
+                        alpha = rect_opacity * ((j + 1) / m)
+
+                    # rectangle corners (closed polygon)
+                    L = rect_length / 2.0
+                    W = rect_width / 2.0
+                    corners_body = np.array([[ L,  W],
+                                            [ L, -W],
+                                            [-L, -W],
+                                            [-L,  W],
+                                            [ L,  W]])
+                    c = np.cos(theta)
+                    s = np.sin(theta)
+                    R = np.array([[c, -s],
+                                [s,  c]])
+                    corners_world = (R @ corners_body.T).T + np.array([x_c, y_c])
+                    # build RGBA fillcolor string with alpha
+                    rgba_color = _rgba_from_color(color, alpha)
+
+                    # rectangle trace (filled)
+                    rect_trace = go.Scatter(
+                        x=corners_world[:, 0].tolist(),
+                        y=corners_world[:, 1].tolist(),
+                        mode='lines',
+                        fill='toself',
+                        fillcolor=rgba_color,
+                        line=dict(color=color),
+                        hoverinfo='skip',
+                        showlegend=False
+                    )
+                    data_.append(rect_trace)
+                    traces_.append(rect_trace_idx)
+
+                    # arrow shaft: from center to arrow tip along heading
+                    shaft_len = arrow_length
+                    tip_x = x_c + shaft_len * np.cos(theta)
+                    tip_y = y_c + shaft_len * np.sin(theta)
+                    shaft_trace = go.Scatter(
+                        x=[x_c, tip_x],
+                        y=[y_c, tip_y],
+                        mode='lines',
+                        line=dict(color=color, width=2),
+                        hoverinfo='skip',
+                        showlegend=False
+                    )
+                    data_.append(shaft_trace)
+                    traces_.append(shaft_trace_idx)
+
+                    # arrow head: small triangle at the tip
+                    head_len = arrow_head_length
+                    head_w = arrow_head_width
+                    # triangle in body coords (tip at (0,0), base behind tip)
+                    head_body = np.array([[0.0, 0.0],
+                                        [-head_len, head_w],
+                                        [-head_len, -head_w],
+                                        [0.0, 0.0]])
+                    head_world = (R @ head_body.T).T + np.array([tip_x, tip_y])
+                    head_color_rgba = _rgba_from_color(color, alpha)
+                    head_trace = go.Scatter(
+                        x=head_world[:, 0].tolist(),
+                        y=head_world[:, 1].tolist(),
+                        mode='lines',
+                        fill='toself',
+                        fillcolor=head_color_rgba,
+                        line=dict(color=color),
+                        hoverinfo='skip',
+                        showlegend=False
+                    )
+                    data_.append(head_trace)
+                    traces_.append(head_trace_idx)
+
+            # set updated data/traces for this frame
+            frame.data = data_
+            frame.traces = traces_
+
+            print(frame.data)
+
+        if resize:
+            self._resize(data, "tracks")
+
+        # call existing uncertainty and particle handlers (unchanged usage)
+        if uncertainty:
+            name = f'{label}<br>Uncertainty'
+            uncertainty_kwargs = dict(x=[], y=[], legendgroup=name, fill='toself',
+                                    fillcolor=self.colorway[2],
+                                    opacity=0.2, legendrank=500, name=name,
+                                    hoverinfo='skip',
+                                    mode='none', showlegend=True)
+            uncertainty_kwargs.update(kwargs)
+
+            # dummy trace for legend for uncertainty
+            self.fig.add_trace(go.Scatter(uncertainty_kwargs))
+
+            # and an uncertainty ellipse trace for each track
+            uncertainty_kwargs.update({'showlegend': False})
+            for k, _ in enumerate(tracks):
+                uncertainty_kwargs.update({'fillcolor': self.colorway[(k + 2) % len(self.colorway)]})
+                uncertainty_kwargs.update(kwargs)
+                self.fig.add_trace(go.Scatter(uncertainty_kwargs))
+
+            self._plot_particles_and_ellipses(tracks, mapping, resize, method="uncertainty")
+
+        if particle:
+            name = f'{label}<br>Particles'
+            particle_kwargs = dict(mode='markers', marker=dict(size=2, color=self.colorway[2]),
+                                opacity=0.4,
+                                hoverinfo='skip', legendgroup=name, name=name,
+                                legendrank=520, showlegend=True)
+            particle_kwargs.update(kwargs)
+            self.fig.add_trace(go.Scatter(particle_kwargs))
+
+            particle_kwargs.update({"showlegend": False})
+            for k, track in enumerate(tracks):
+                particle_kwargs.update({'marker': dict(size=2, color=self.colorway[(k + 2) % len(self.colorway)])})
+                particle_kwargs.update(kwargs)
+                self.fig.add_trace(go.Scatter(particle_kwargs))
+
+            self._plot_particles_and_ellipses(tracks, mapping, resize, method="particles")
+
+        self.plotting_function_called = True
+
+
+    # ---- helper to create rgba string from color (supports hex or 'rgb(...)' or color names) ----
+    def _rgba_from_color(color, alpha):
+        """
+        Return CSS rgba(r,g,b,a) string for plotly fillcolor given input color str and alpha.
+        Supports hex colors (#RRGGBB or #RGB) and 'rgb(r,g,b)' et al. Falls back to color with alpha if unknown.
+        """
+        try:
+            # if color is hex: #RRGGBB or #RGB
+            c = color.lstrip('#')
+            if len(c) == 6:
+                r = int(c[0:2], 16)
+                g = int(c[2:4], 16)
+                b = int(c[4:6], 16)
+                return f'rgba({r},{g},{b},{alpha})'
+            if len(c) == 3:
+                r = int(c[0] * 2, 16)
+                g = int(c[1] * 2, 16)
+                b = int(c[2] * 2, 16)
+                return f'rgba({r},{g},{b},{alpha})'
+            # if color is 'rgb(r,g,b)' style, extract numbers
+            if color.startswith('rgb'):
+                nums = color[color.find('(')+1:color.find(')')].split(',')
+                r, g, b = [int(n) for n in nums[:3]]
+                return f'rgba({r},{g},{b},{alpha})'
+        except Exception:
+            pass
+        # fallback: return color with alpha appended (plotly accepts 'rgba(...)' and some color names with alpha)
+        return color
+
+
     def _plot_particles_and_ellipses(self, tracks, mapping, resize, method="uncertainty"):
 
         """
