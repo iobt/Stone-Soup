@@ -29,6 +29,10 @@ class CTRV(GaussianTransitionModel, TimeVariantModel):
     turn_noise_coeff: float = Property(
         doc=r"The turn rate noise coefficient :math:`q_\omega`")
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.Q = None
+
     @property
     def ndim_state(self):
         """ndim_state getter method
@@ -49,12 +53,21 @@ class CTRV(GaussianTransitionModel, TimeVariantModel):
         psi      = state.state_vector[2,:]
         v        = state.state_vector[3,:]
         omega    = state.state_vector[4,:]
+    
+        #Pxnew    = Px + dt*v*np.cos(psi + dt*omega/2)*np.sinc(dt*omega/2)
+        #Pynew    = Py + dt*v*np.sin(psi + dt*omega/2)*np.sinc(dt*omega/2)        
+        #psinew   = psi + dt*omega
 
-        Pxnew    = Px + dt*v*np.cos(psi + dt*omega/2)*np.sinc(dt*omega/2)
-        Pynew    = Py + dt*v*np.sin(psi + dt*omega/2)*np.sinc(dt*omega/2)        
-        psinew   = psi + dt*omega
+        w            = dt * omega / 2       # half-angle term
+        psi_mid      = psi + w              # mid-point angle
+        sinc_val     = np.sinc(w / np.pi)   # numpy's sinc(x) = sin(π*x)/(π*x)
+        cos_psi_mid  = np.cos(psi_mid)
+        sin_psi_mid  = np.sin(psi_mid)
+        Pxnew        = Px + dt*v*cos_psi_mid*sinc_val
+        Pynew        = Py + dt*v*sin_psi_mid*sinc_val
+        psinew       = psi + dt*omega
 
-        svnew    = StateVectors([Pxnew,Pynew,psinew,v,omega])
+        svnew        = StateVectors([Pxnew,Pynew,psinew,v,omega])
 
         if isinstance(noise, bool) or noise is None:
             if noise:
@@ -64,6 +77,55 @@ class CTRV(GaussianTransitionModel, TimeVariantModel):
                 noise = 0
         
         return svnew + noise
+    
+    def jacobian(self, state, **kwargs):
+
+        dt       = kwargs['time_interval'].total_seconds()
+
+        Px       = state.state_vector[0,:]
+        Py       = state.state_vector[1,:]
+        psi      = state.state_vector[2,:]
+        v        = state.state_vector[3,:]
+        omega    = state.state_vector[4,:]
+
+        w            = dt * omega / 2       # half-angle term
+        psi_mid      = psi + w              # mid-point angle
+        sinc_val     = np.sinc(w / np.pi)   # numpy's sinc(x) = sin(π*x)/(π*x)
+        cos_psi_mid  = np.cos(psi_mid)
+        sin_psi_mid  = np.sin(psi_mid)
+
+        j = np.zeros((5,5))
+        j[0,0] = 1 #dfx/dx
+        j[1,1] = 1 #df[y]/dy
+
+        j[0,2] = -dt*v*sin_psi_mid*sinc_val #df[x]/dpsi
+        j[1,2] = dt*v*cos_psi_mid*sinc_val #df[y]/dpsi
+        j[2,2] = 1 #df[psi]/dpsi
+        j[3,2] = 0 #df[v]/dpsi
+        j[4,2] = 0 #df[omega]/dpsi
+
+        j[0,3] = dt*cos_psi_mid*sinc_val #df[x]/dv
+        j[1,3] = dt*sin_psi_mid*sinc_val #df[y]/dv
+        j[2,3] = 0 #df[psi]/dv
+        j[3,3] = 1 #df[v]/dv
+        j[4,3] = 0 #df[omega]/dv
+
+        if np.abs(w) < 1e-10:
+            dsinc_dw = 0.0
+        else:
+            dsinc_dw = (w * np.cos(w) - np.sin(w)) / (w**2)
+
+        j[0,4] = 0.5*(dt**2)*v*(-sin_psi_mid*sinc_val + cos_psi_mid*dsinc_dw) #df[x]/domega
+        j[1,4] = 0.5*(dt**2)*v*(cos_psi_mid*sinc_val + sin_psi_mid*dsinc_dw) #df[y]/domega
+        j[2,4] = dt #df[psi]/domega
+        j[3,4] = 0 #df[v]/domega
+        j[4,4] = 1 #df[omega]/domega
+
+        #Store Q for this state
+        kwargs["state_vectors"] = StateVectors([Px,Py,psi,v,omega])
+        self.Q = self.covar(**kwargs)
+
+        return j
     
     def rvs(self, num_samples=1, **kwargs):
 
@@ -93,7 +155,12 @@ class CTRV(GaussianTransitionModel, TimeVariantModel):
 
         state_vectors    = kwargs.get("state_vectors",None)
         if state_vectors is None:
-            raise ValueError("state_vectprs must be provided to compute the covariance matrix")
+            if(self.Q is None):
+                raise ValueError("state_vectors must be provided to compute the covariance matrix if covar is not cached")
+            else:
+                #Assume Q for the current state has been cached
+                #Works for EKF that compute jacobian before covar is called 
+                return self.Q
 
         if(len(state_vectors.shape))==1:
             state_vectors = state_vectors.reshape(-1,1)
@@ -189,11 +256,12 @@ class kinematic_bicycle(GaussianTransitionModel, TimeVariantModel):
         Pynew    = Py + dt*v*np.sin((beta + theta) + dt*v*ta*co/(2*L))*np.sinc(dt*v*ta*co/(2*L))
         vnew     = v  
         
-        thetanew   = theta + dt*v*ta*co/L
-        
-        deltanew = delta
+        thetanew  = theta + dt*v*ta*co/L
+        #thetanew = (thetanew) % (np.pi*2)  -np.pi
+        deltanew  = delta
+        deltanew = np.clip(deltanew, -np.pi/4, np.pi/4)
 
-        svnew    = StateVectors([Pxnew,Pynew,vnew,thetanew,deltanew])
+        svnew     = StateVectors([Pxnew,Pynew,vnew,thetanew,deltanew])
 
         if isinstance(noise, bool) or noise is None:
             if noise:
@@ -201,8 +269,17 @@ class kinematic_bicycle(GaussianTransitionModel, TimeVariantModel):
                 noise = self.rvs(num_samples=state.state_vector.shape[1], **kwargs)
             else:
                 noise = 0
-        
-        return svnew + noise
+
+        Pxnew    = Pxnew + noise[0,:]
+        Pynew    = Pynew + noise[1,:]
+        vnew     = vnew  + noise[2,:]
+        thetanew = (thetanew + noise[3,:]) 
+        #thetanew = (thetanew % (np.pi*2)) -np.pi
+        deltanew = np.clip(deltanew + noise[4,:], -np.pi/4, np.pi/4)
+
+        svnew    = StateVectors([Pxnew,Pynew,vnew,thetanew,deltanew])
+
+        return svnew
 
     def rvs(self, num_samples=1, **kwargs):
 
@@ -289,12 +366,178 @@ class kinematic_bicycle(GaussianTransitionModel, TimeVariantModel):
         
         Q[:,4,4] = q_d * dt #This is a float scalar
 
-        Q = np.tril(Q) + np.transpose(np.tril(Q,k=-1),axes=(0,2,1)) + 1e-10*np.reshape(np.eye(state_dim),(1,state_dim,state_dim))    
+        Q = np.tril(Q) + np.transpose(np.tril(Q,k=-1),axes=(0,2,1)) + 1e-8*np.reshape(np.eye(state_dim),(1,state_dim,state_dim))    
         if(batch_size == 1):
             return Q[0,:,:]
         else:
             return Q
 
+
+
+class kinematic_bicycle2(GaussianTransitionModel, TimeVariantModel):
+
+    r"""This is a class implementation of a discrete, time-variant 2D kinematic bicycle model.
+
+    The target is assumed to move with (nearly) constant velocity and also
+    an unknown (nearly) constant steering angle. This implementation uses a
+    state-dependent noise covariance matrix.
+    """
+    std_accl: float = Property(
+        doc=r"The linear acceleration noise in the heading direction :math:`q_l`")
+    std_accd: float = Property(
+        doc=r"The turn rate noise coefficient :math:`q_\omega`")
+    use_circular: bool = Property(
+        default=True,
+        doc=r"Whether to use circular motion model for angle normalization")
+    L: float = Property(
+        default=5,
+        doc=r"Wheel base length")
+    verbose: bool = Property(
+        default=True,
+        doc=r"Whether to produce verbose output.")
+
+    @property
+    def ndim_state(self):
+        """ndim_state getter method
+
+        Returns
+        -------
+        : :class:`int`
+            The number of combined model state dimensions.
+        """
+        return 5
+
+    def function(self, state, noise=False, **kwargs) -> StateVector:
+        dt       = kwargs['time_interval'].total_seconds()
+
+        Px       = state.state_vector[0,:]
+        Py       = state.state_vector[1,:]
+        v        = state.state_vector[2,:]
+        theta    = state.state_vector[3,:]
+        delta    = state.state_vector[4,:]
+
+        L = self.L
+        l_r = L/2
+        ta = np.tan(delta)
+        S = L/ta
+        beta = np.arctan(l_r*ta/L)
+        co = np.cos(beta)
+        R = S/co
+
+        Pxnew    = Px + dt*v*np.cos((beta + theta) + dt*v*ta*co/(2*L))*np.sinc(dt*v*ta*co/(2*L))
+        Pynew    = Py + dt*v*np.sin((beta + theta) + dt*v*ta*co/(2*L))*np.sinc(dt*v*ta*co/(2*L))
+        vnew     = v  
+        
+        # thetanew   = np.atan2(np.sin(theta + dt*v*ta*co/L),np.cos(theta + dt*v*ta*co/L))
+        thetanew   = theta + dt*v*ta*co/L
+        deltanew = delta
+
+        svnew     = StateVectors([Pxnew,Pynew,vnew,thetanew,deltanew])
+
+        if isinstance(noise, bool) or noise is None:
+            if noise:
+                kwargs["state_vectors"] = svnew 
+                noise = self.rvs(num_samples=state.state_vector.shape[1], **kwargs)
+
+                Pxnew    = Pxnew + noise[0,:]
+                Pynew    = Pynew + noise[1,:]
+                vnew     = vnew  + noise[2,:]
+                thetanew = (thetanew + noise[3,:]) 
+                #thetanew = (thetanew % (np.pi*2)) -np.pi
+                deltanew = np.clip(deltanew + noise[4,:], -np.pi/4, np.pi/4)
+                svnew    = StateVectors([Pxnew,Pynew,vnew,thetanew,deltanew])
+
+        return svnew
+
+    def rvs(self, num_samples=1, **kwargs):
+
+        Qs = self.covar(**kwargs)
+        Qs = Qs.reshape(-1,5,5)
+
+        if(Qs.shape[0]>1):
+            num_samples=1
+            
+        noise = [multivariate_normal(np.zeros(self.ndim), Q).rvs(num_samples).reshape(-1,num_samples) for Q in Qs]
+
+        return np.hstack(noise)
+
+    def covar(self, time_interval, **kwargs):
+        dt = time_interval.total_seconds()
+        state_vectors    = kwargs.get("state_vectors",None)
+
+        q_v = self.std_accl**2
+        q_d = self.std_accd**2
+
+        state_vectors    = kwargs.get("state_vectors",None)
+        if state_vectors is None:
+            raise ValueError("state_vectprs must be provided to compute the covariance matrix")
+
+        if(len(state_vectors.shape))==1:
+            state_vectors = state_vectors.reshape(-1,1)
+
+        state_dim, batch_size = state_vectors.shape
+
+        if(state_dim != self.ndim_state):
+            raise ValueError("state dimension mismatch")
+
+        Q = np.zeros((batch_size,state_dim,state_dim))
+
+        Px       = state_vectors[0,:]
+        Py       = state_vectors[1,:]
+        v        = state_vectors[2,:]
+        theta    = state_vectors[3,:]
+        delta    = state_vectors[4,:]
+
+        L = self.L
+        l_r = L/2
+        ta = np.tan(delta)
+        S = L/ta
+        beta = np.arctan(l_r*ta/L)
+        co = np.cos(beta)
+        R = S/co
+        sith = np.sin(theta+beta)
+        coth = np.cos(theta+beta)
+        cs = coth*sith
+        sec = 1/np.cos(delta)
+        d_beta = L * l_r * sec**2/(L**2 + l_r**2 * ta**2)
+        m = sec**2 * co - ta * np.sin(beta) * d_beta
+               
+        Q[:,0,0] = ((1/3) * dt**3 * (q_v * (coth**2) + q_d * (sith**2 * d_beta**2 * v**2)) + (1/4) * dt**4 * (q_v * (-cs * v * ta * co/L) + q_d * (sith**2 * d_beta * v**3 * m/L))  + (1/20) * dt**5 * (q_v * (v**2 * sith**2 * ta**2 * co**2/L**2) + q_d * (v**4 * sith**2  * m**2/L**2))).squeeze() 
+        
+        Q[:,1,0] = ((1/3) * dt**3 * (q_v * (cs) - q_d * (cs * d_beta**2 * v**2)) + (1/4) * dt**4 * (q_v * (v * ta * co * (coth**2 - sith**2)/(2*L)) + q_d * (-cs * d_beta * v**3 * m/L))  + (1/20) * dt**5 * (q_v * (-cs * v**2 * ta**2 * co**2/L**2) + q_d * (-cs * v**4 * m**2/L**2))).squeeze() 
+        
+        Q[:,1,1] = ((1/3) * dt**3 * (q_v * (sith**2) + q_d * (coth**2 * d_beta**2 * v**2)) + (1/4) * dt**4 * (q_v * (cs * v * ta * co/L) + q_d * (coth**2 * d_beta * v**3 * m/L))  + (1/20) * dt**5 * (q_v * (v**2 * coth**2 * ta**2 * co**2/L**2) + q_d * (v**4 * coth**2  * m**2/L**2))).squeeze() 
+        
+        Q[:,2,0] = ((1/2) * dt**2 * q_v * (coth) + (1/6) * dt**3 * q_v * (-sith * v * ta * co/L )).squeeze()
+        
+        Q[:,2,1] = ((1/2) * dt**2 * q_v * (sith) + (1/6) * dt**3 * q_v * (coth * v * ta * co/L )).squeeze()
+        
+        Q[:,2,2] = (q_v * dt)
+        
+        Q[:,3,0] = ((1/3) * dt**3 * (q_v * (coth * ta * co/L) + q_d * (-sith * v**2 * m * d_beta/L)) + (1/4) * dt**4 * (q_v * (-sith * v * ta**2 * co**2/(2 * L**2)) + q_d * (-sith * v**3 * m**2/(2 * L**2)))).squeeze() 
+        
+        Q[:,3,1] = ((1/3) * dt**3 * (q_v * (sith * ta * co/L) + q_d * (coth * v**2 * m * d_beta/L)) + (1/4) * dt**4 * (q_v * (coth * v * ta**2 * co**2/(2 * L**2)) + q_d * (coth * v**3 * m**2/(2 * L**2)))).squeeze() 
+        
+        Q[:,3,2] = ((1/2) * dt**2 * q_v * ta * co/L).squeeze()
+        
+        Q[:,3,3] = ((1/3) * dt**3 * (q_v * (ta**2 * co**2/L**2) + q_d * (v**2 * m**2/L**2))).squeeze()
+        
+        Q[:,4,0] = ((1/2) * dt**2 * (q_d * (-sith * d_beta * v)) + (1/3) * dt**3 * (q_d * (-sith * v**2 * m/(2*L)))).squeeze() 
+        
+        Q[:,4,1] = ((1/2) * dt**2 * (q_d * (coth * d_beta * v)) + (1/3) * dt**3 * (q_d * (coth * v**2 * m/(2*L)))).squeeze() 
+        
+        Q[:,4,2] = 0
+        
+        Q[:,4,3] = ((1/2) * dt**2 * q_d * v * m/L).squeeze()
+        
+        Q[:,4,4] = (q_d * dt)
+
+
+        Q = np.tril(Q) + np.transpose(np.tril(Q,k=-1),axes=(0,2,1)) + 1e-8*np.reshape(np.eye(state_dim),(1,state_dim,state_dim))    
+        if(batch_size == 1):
+            return Q[0,:,:]
+        else:
+            return Q
 
 
 
