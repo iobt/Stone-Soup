@@ -370,9 +370,6 @@ class UnscentedKalmanPredictor(KalmanPredictor):
         ctrl_mat = self._control_matrix(
             control_input, prior=prior, time_interval=predict_over_interval, **kwargs)
         ctrl_noi = self.control_model.covar(time_interval=predict_over_interval, **kwargs)
-        total_noise_covar = \
-            self.transition_model.covar(time_interval=predict_over_interval, **kwargs) \
-            + ctrl_mat @ ctrl_noi @ ctrl_mat.T
 
         # Get the sigma points from the prior mean and covariance.
         sigma_point_states, mean_weights, covar_weights = gauss2sigma(
@@ -386,12 +383,20 @@ class UnscentedKalmanPredictor(KalmanPredictor):
             time_interval=predict_over_interval,
             **kwargs)
 
-        # Put these through the unscented transform, together with the total
-        # covariance to get the parameters of the Gaussian
-        x_pred, p_pred, _, _, _, _ = unscented_transform(
+        # Put these through the unscented transform, covar_noise will be added subsequently
+        x_pred, p_pred, cross_covar, sigma_points_t, mean_weights, covar_weights = unscented_transform(
             sigma_point_states, mean_weights, covar_weights,
-            transition_and_control_function, covar_noise=total_noise_covar
+            transition_and_control_function, covar_noise=None
         )
+
+        #Compute process noise covariance
+        #Note: mean weights sum to 1, covar weights do not. Use mean weights.
+        #Note: mean weights are not positive. The weighted sum could lead to non PSD matrix
+        noise_covars = self.transition_model.covar(time_interval=predict_over_interval, state_vectors=sigma_points_t,**kwargs)
+        weighted_noise_covar = np.sum(mean_weights.reshape(-1,1,1) * noise_covars, axis=0)
+
+        #Add process noise and control noise to unscented transform-estimated covariance
+        p_pred = p_pred + weighted_noise_covar + ctrl_mat @ ctrl_noi @ ctrl_mat.T
 
         # and return a Gaussian state based on these parameters
         return Prediction.from_state(prior, x_pred, p_pred, timestamp=timestamp,
