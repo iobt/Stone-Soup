@@ -3,7 +3,7 @@ from functools import partial
 import numpy as np
 import scipy.linalg as la
 
-from ..types.array import CovarianceMatrix, StateVector
+from ..types.array import CovarianceMatrix, StateVector, StateVectors
 from .base import Predictor
 from ._utils import predict_lru_cache
 from ..base import Property
@@ -149,7 +149,8 @@ class KalmanPredictor(Predictor):
         prior_cov = prior.covar
         trans_m = self._transition_matrix(prior=prior, time_interval=predict_over_interval,
                                           **kwargs)
-        trans_cov = self.transition_model.covar(time_interval=predict_over_interval, **kwargs)
+        
+        trans_cov = self.transition_model.covar(time_interval=predict_over_interval, state_vectors=StateVectors([prior.state_vector]), **kwargs)
 
         # As this is Kalman-like, the control model must be capable of
         # returning a control matrix (B)

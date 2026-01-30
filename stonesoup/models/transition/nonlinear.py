@@ -6,7 +6,7 @@ from scipy.linalg import block_diag
 from scipy.stats import multivariate_normal
 
 from .base import TransitionModel
-from ..base import GaussianModel, TimeVariantModel
+from ..base import GaussianModel, TimeVariantModel, STVGaussianModel
 from ...base import Property
 from ...types.array import CovarianceMatrix, StateVector, StateVectors
 
@@ -14,9 +14,184 @@ from ...types.array import CovarianceMatrix, StateVector, StateVectors
 class GaussianTransitionModel(TransitionModel, GaussianModel):
     pass
 
+class STVGaussianTransitionModel(TransitionModel, STVGaussianModel):
+    pass
+
+class CTRV_STV(STVGaussianTransitionModel, TimeVariantModel):
+    r"""This is a class implementation of a discrete, time-variant 2D Constant
+    Turn Rate and Velocity Model (CTRV).
+
+    The target is assumed to move with (nearly) constant velocity and also
+    an unknown (nearly) constant turn rate. This implementation uses a
+    state-dependent noise covariance matrix.
+    """
+    linear_noise_coeff: float = Property(
+        doc=r"The linear acceleration noise in the heading direction :math:`q_l`")
+    turn_noise_coeff: float = Property(
+        doc=r"The turn rate noise coefficient :math:`q_\omega`")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.Q = None
+
+    @property
+    def ndim_state(self):
+        """ndim_state getter method
+
+        Returns
+        -------
+        : :class:`int`
+            The number of combined model state dimensions.
+        """
+        return 5
 
 
-class CTRV(GaussianTransitionModel, TimeVariantModel):
+    def function(self, state, noise=False, **kwargs) -> StateVector:
+        dt       = kwargs['time_interval'].total_seconds()
+
+        Px       = state.state_vector[0,:]
+        Py       = state.state_vector[1,:]
+        psi      = state.state_vector[2,:]
+        v        = state.state_vector[3,:]
+        omega    = state.state_vector[4,:]
+    
+        w            = dt * omega / 2       # half-angle term
+        psi_mid      = psi + w              # mid-point angle
+        sinc_val     = np.sinc(w / np.pi)   # numpy's sinc(x) = sin(π*x)/(π*x)
+        cos_psi_mid  = np.cos(psi_mid)
+        sin_psi_mid  = np.sin(psi_mid)
+        Pxnew        = Px + dt*v*cos_psi_mid*sinc_val
+        Pynew        = Py + dt*v*sin_psi_mid*sinc_val
+        psinew       = psi + dt*omega
+
+        svnew        = StateVectors([Pxnew,Pynew,psinew,v,omega])
+
+        if isinstance(noise, bool) or noise is None:
+            if noise:
+                noise = self.rvs(svnew, num_samples=state.state_vector.shape[1], **kwargs)
+            else:
+                noise = 0
+        
+        return svnew + noise
+    
+    def jacobian(self, state, **kwargs):
+
+        dt       = kwargs['time_interval'].total_seconds()
+
+        Px       = state.state_vector[0,:]
+        Py       = state.state_vector[1,:]
+        psi      = state.state_vector[2,:]
+        v        = state.state_vector[3,:]
+        omega    = state.state_vector[4,:]
+
+        w            = dt * omega / 2       # half-angle term
+        psi_mid      = psi + w              # mid-point angle
+        sinc_val     = np.sinc(w / np.pi)   # numpy's sinc(x) = sin(π*x)/(π*x)
+        cos_psi_mid  = np.cos(psi_mid)
+        sin_psi_mid  = np.sin(psi_mid)
+
+        j = np.zeros((5,5))
+        j[0,0] = 1 #dfx/dx
+        j[1,1] = 1 #df[y]/dy
+
+        j[0,2] = -dt*v*sin_psi_mid*sinc_val #df[x]/dpsi
+        j[1,2] = dt*v*cos_psi_mid*sinc_val #df[y]/dpsi
+        j[2,2] = 1 #df[psi]/dpsi
+        j[3,2] = 0 #df[v]/dpsi
+        j[4,2] = 0 #df[omega]/dpsi
+
+        j[0,3] = dt*cos_psi_mid*sinc_val #df[x]/dv
+        j[1,3] = dt*sin_psi_mid*sinc_val #df[y]/dv
+        j[2,3] = 0 #df[psi]/dv
+        j[3,3] = 1 #df[v]/dv
+        j[4,3] = 0 #df[omega]/dv
+
+        if np.abs(w) < 1e-10:
+            dsinc_dw = 0.0
+        else:
+            dsinc_dw = (w * np.cos(w) - np.sin(w)) / (w**2)
+
+        j[0,4] = 0.5*(dt**2)*v*(-sin_psi_mid*sinc_val + cos_psi_mid*dsinc_dw) #df[x]/domega
+        j[1,4] = 0.5*(dt**2)*v*(cos_psi_mid*sinc_val + sin_psi_mid*dsinc_dw) #df[y]/domega
+        j[2,4] = dt #df[psi]/domega
+        j[3,4] = 0 #df[v]/domega
+        j[4,4] = 1 #df[omega]/domega
+
+        #Store Q for this state
+        #kwargs["state_vectors"] = StateVectors([Px,Py,psi,v,omega])
+        #self.Q = self.covar(**kwargs)
+
+        return j
+    
+    def rvs(self, state_vectors, num_samples=1, **kwargs):
+
+        time_interval = kwargs["time_interval"]
+
+        Qs = self.covar(time_interval,state_vectors)
+        Qs = Qs.reshape(-1,5,5)
+
+        if(Qs.shape[0]>1):
+            num_samples=1
+            
+        noise = [multivariate_normal(np.zeros(self.ndim), Q).rvs(num_samples).reshape(-1,num_samples) for Q in Qs]
+
+        return np.hstack(noise)
+
+    def covar(self, time_interval, state_vectors, **kwargs):
+        """Returns the transition model noise covariance matrix.
+
+        Returns
+        -------
+        : :class:`stonesoup.types.state.CovarianceMatrix` of shape\
+        (:py:attr:`~ndim_state`, :py:attr:`~ndim_state`)
+            The process noise covariance.
+        """
+
+        dt       = time_interval.total_seconds()
+        var_accl = self.linear_noise_coeff
+        var_accy = self.turn_noise_coeff
+
+        if(len(state_vectors.shape))==1:
+            state_vectors = state_vectors.reshape(-1,1)
+
+        state_dim, batch_size = state_vectors.shape
+
+        if(state_dim != self.ndim_state):
+            raise ValueError("state dimension mismatch")
+
+        psik = state_vectors[2,:]
+        vk   = state_vectors[3,:]
+
+        si = np.sin(psik)
+        co = np.cos(psik)
+        cs = np.cos(psik)*np.sin(psik)
+
+        Q = np.zeros((batch_size,state_dim,state_dim))
+
+        Q[:,0,0] = (var_accl * ((1/3) * dt**3 * co**2) + var_accy * ((1/20) * dt**5 * vk**2 * si**2)).squeeze()
+        Q[:,1,0] = (var_accl*((1/3) * dt**3 * cs) - var_accy*( (1/20) * dt**5 * vk**2 * cs)).squeeze()
+        Q[:,1,1] = (var_accl*((1/3) * dt**3 * si**2) + var_accy*( (1/20) * dt**5 * vk**2 * co**2)).squeeze()
+        Q[:,2,0] = (-var_accy*((1/8) * vk * dt**4 * si)).squeeze()
+        Q[:,2,1] = (var_accy*((1/8) * vk * dt**4 * co)).squeeze()
+        Q[:,2,2] = (var_accy*((1/3) * dt**3))
+        Q[:,3,0] = (var_accl*((1/2) * dt**2 * co)).squeeze()
+        Q[:,3,1] = (var_accl*((1/2) * dt**2 * si)).squeeze()
+        Q[:,3,2] = 0
+        Q[:,3,3] = (var_accl * dt)
+        Q[:,4,0] = (-var_accy*(vk * (1/6) * dt**3 * si)).squeeze()
+        Q[:,4,1] = (var_accy*(vk * (1/6) * dt**3 * co)).squeeze()
+        Q[:,4,2] = (var_accy*((1/2) * dt**2))
+        Q[:,4,3] = 0
+        Q[:,4,4] = (var_accy * dt)
+
+        Q = np.tril(Q) + np.transpose(np.tril(Q,k=-1),axes=(0,2,1)) + 1e-10*np.reshape(np.eye(state_dim),(1,state_dim,state_dim))    
+        if(batch_size == 1):
+            return Q[0,:,:]
+        else:
+            return Q
+
+
+class CTRV_Hack(GaussianTransitionModel, TimeVariantModel):
     r"""This is a class implementation of a discrete, time-variant 2D Constant
     Turn Rate and Velocity Model (CTRV).
 

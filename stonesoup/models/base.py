@@ -342,3 +342,44 @@ class GaussianModel(Model):
     @abstractmethod
     def covar(self, **kwargs) -> CovarianceMatrix:
         """Model covariance"""
+
+
+
+class StateVariantModel(Model):
+    pass
+
+
+class StateTimeVariant(TimeVariantModel, StateVariantModel):
+    pass
+
+class SVGaussianModel(GaussianModel, StateVariantModel):
+    @abstractmethod
+    def covar(self, state_vectors: StateVectors, **kwargs):
+        """Return covariance for given state vectors."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def rvs(self, state_vectors: StateVectors, num_samples: int = 1, **kwargs):
+        """Draw random samples for given state vectors."""
+        raise NotImplementedError
+
+class SVGaussianConcrete(SVGaussianModel):
+    def covar(self, state_vectors: StateVectors, **kwargs):
+        # attach the state vectors under the 'state' key for upstream usage
+        kwargs['state'] = state_vectors
+        return super().covar(state_vectors, **kwargs)
+
+    def logpdf(self, state1: State, state2: State, **kwargs) -> Union[float, np.ndarray]:
+        # wrap state2 into StateVectors and pass it upstream
+        kwargs['state'] = StateVectors(state2)
+        return super().logpdf(state1, state2, **kwargs)
+
+class STVGaussianModel(GaussianModel, StateTimeVariant):
+    @abstractmethod
+    def covar(self, time_interval, state_vectors: StateVectors, **kwargs):
+        """Covariance that depends on a time interval and state vectors."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def rvs(self, time_interval, state_vectors: StateVectors, num_samples: int = 1, **kwargs):
+        raise NotImplementedError
